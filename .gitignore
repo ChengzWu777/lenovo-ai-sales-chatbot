@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# ChromaDB
+data/chroma_db/
+
+# Evaluation results
+evaluation/results_*.json
+
+# Environment
+.env
+.env.local
+
+# VS Code
+.vscode/
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Docs (keep docx in repo)
+Phase1_Baseline_Report.docx
+Phase2_Comparison_Report.docx
