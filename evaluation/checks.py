@@ -1,7 +1,7 @@
 """Pure check functions used by the evaluator. No LLM, no I/O — unit-tested in tests/."""
 import re
 
-from agents.catalog import find_exact_mentions
+from agents.catalog import find_exact_mentions, load_products
 from agents.filters import SOFT_BUDGET_TOLERANCE
 
 _PRICE_RE = re.compile(r"\$\s?(\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{2})?")
@@ -56,8 +56,11 @@ def check_grounding(response: str, provided: list) -> dict:
 
     wrong_prices = []
     low = response.lower().replace("*", "")
+    all_names = [q["name"].lower() for q in load_products()]
     for p in mentioned:
         name = p["name"].lower()
+        # Catalog names that extend this one: "ThinkBook 14 Gen 7" -> "ThinkBook 14 Gen 7 Intel".
+        longer = [n for n in all_names if n != name and n.startswith(name)]
         start = 0
         while True:
             idx = low.find(name, start)
@@ -65,6 +68,8 @@ def check_grounding(response: str, provided: list) -> dict:
                 break
             end = idx + len(name)
             start = end
+            if any(low.startswith(n, idx) for n in longer):
+                continue   # this occurrence is the sibling model; its price is checked under its own name
             window = low[end:end + 60]
             # Stop at the next line: a table row or bullet belongs to one product.
             window = window.split("\n")[0]

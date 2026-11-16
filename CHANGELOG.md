@@ -15,7 +15,7 @@ symptom, the cause, and the test that now pins it.
 | `must_include` passed on any single keyword; a category of `all` always passed; `\$(\d{3,4})` missed `$1,299`. | Catalog-based constraint check, strict category check, price parser that handles commas. |
 | Nothing checked whether the answer was grounded in the retrieved products. | Grounding check: named products must have been provided, quoted prices must match the catalog. |
 | No multi-turn coverage. | 14 multi-turn conversations. |
-| The evaluation design document described per-step metrics that were never implemented. | Slot, intent, routing and cache behaviour are covered by 195 unit tests; the document now has an implementation-status table. |
+| The evaluation design document described per-step metrics that were never implemented. | Slot, intent, routing and cache behaviour are covered by 196 unit tests; the document now has an implementation-status table. |
 
 Running the rebuilt suite immediately found two further bugs (a message with only a dollar amount, and the
 reply to a clarifying question, were both classified off-topic). Both are fixed and tested.
@@ -97,3 +97,12 @@ Budget semantics changed: a stated budget is a hard ceiling. Only approximate ph
 - `requirements.txt`, `requirements-test.txt`, GitHub Actions workflow (unit tests + stub evaluation).
 - Catalog count corrected: 65 products (README and metadata said 60).
 - README rewritten; earlier evaluation numbers marked as retired with the reasons.
+
+### After the first real-LLM run
+
+- The grounding check compared a price against the wrong model when one catalog name is a prefix of another
+  ("ThinkBook 14 Gen 7" / "ThinkBook 14 Gen 7 Intel"). Occurrences that belong to the longer name are now
+  skipped (`tests/test_evaluation.py::test_check_grounding_does_not_confuse_sibling_models`).
+- `evaluation/recheck.py` re-runs the text checks on a saved results file and prints the answer behind a case.
+- README: real-LLM results and the reasoning on/off latency comparison (6.9 s vs 44.2 s average; time to first
+  token 1.8 s vs 39.8 s).

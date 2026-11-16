@@ -46,6 +46,21 @@ def test_check_grounding_flags_wrong_price():
     assert not bad["ok"] and "catalog $1399" in bad["wrong_prices"][0]
 
 
+def test_check_grounding_does_not_confuse_sibling_models():
+    # Found on the first real-LLM run: "ThinkBook 14 Gen 7 Intel ($799)" was reported as
+    # "ThinkBook 14 Gen 7: said $799, catalog $749" because one name is a prefix of the other.
+    provided = [product("ThinkBook 14 Gen 7"), product("ThinkBook 14 Gen 7 Intel"),
+                product("ThinkPad X1 Carbon Gen 13"), product("X1 Carbon Aura")]
+    text = ("- **ThinkBook 14 Gen 7** ($749) is the value pick.\n"
+            "- **ThinkBook 14 Gen 7 Intel** ($799) adds Arc graphics.\n"
+            "- **ThinkPad X1 Carbon Gen 13 Aura** ($2,099) has the best webcam; "
+            "the ThinkPad X1 Carbon Gen 13 is $1,899.")
+    out = checks.check_grounding(text, provided)
+    assert out["ok"], out
+    wrong = checks.check_grounding("The **ThinkBook 14 Gen 7 Intel** ($749) is great.", provided)
+    assert wrong["wrong_prices"] == ["ThinkBook 14 Gen 7 Intel: said $749, catalog $799"]
+
+
 def test_budget_ceiling():
     assert checks.budget_ceiling(1000, True) == 1000
     assert round(checks.budget_ceiling(1000, False)) == 1100

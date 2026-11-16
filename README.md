@@ -72,7 +72,7 @@ Only the `llm` action calls the model. Everything else is answered deterministic
 | `agents/taxonomy.py` | Shared use-case / category vocabulary |
 | `agents/prompts.py` | Prompt templates and canned replies |
 | `evaluation/` | Test cases, checks, evaluator, CLI |
-| `tests/` | 195 unit / integration tests (no GPU, no model download) |
+| `tests/` | 196 unit / integration tests (no GPU, no model download) |
 
 ---
 
@@ -114,7 +114,7 @@ There are two layers.
 
 ### 1. Unit / integration tests — `pytest`
 
-195 tests, about 3 seconds, no GPU and no model download (a deterministic embedder stands in for
+196 tests, a few seconds, no GPU and no model download (a deterministic embedder stands in for
 sentence-transformers; ChromaDB itself is exercised for real). Covers slot extraction, intent, cache, model-name
 lookup, constraint filtering, graph routing, turn handling (history, timeouts, fallback, cache), the WebSocket
 endpoint, index rebuilds, and the evaluator's own checks.
@@ -165,12 +165,25 @@ before generation?"
 The 4 failures are category labels that need semantic retrieval or are debatable (#22, #26, #33, #40) —
 they are left failing rather than tuned away.
 
-**Real LLM (`--suite all`)** — to be re-measured with the rebuilt evaluator:
+**Real LLM (`--suite all`)** — `qwen3.5:27b` on an RTX 5090, reasoning off, temperature 0.7, single run
+(2026-11-16):
 
 | Metric | Result |
 |--------|--------|
-| Cases passed / Constraints / Grounding / Keywords / Slots / Routing | _run `python -m evaluation.run_eval --suite all`_ |
-| LLM latency avg / p50 / p95, TTFT | _same run_ |
+| Cases passed | 47 / 54 |
+| Constraints | 54 / 54 |
+| Slots | 54 / 54 |
+| Grounding | 52 / 54 |
+| Keywords | 53 / 54 |
+| Routing | 50 / 54 |
+| LLM latency | avg 6.9 s, p50 5.4 s, p95 8.4 s |
+| Time to first token | avg 1.8 s |
+| Turns answered without the LLM | 9 of 64 |
+
+Failures: four category labels (#22, #26, #33, #40 — the same four as without the vector index; category only
+drives the cross-sell buttons), two grounding flags (#6, #32) and one forbidden keyword (#34). One run at
+temperature 0.7 is a snapshot, not a distribution; `python -m evaluation.recheck --show 34` prints the answer
+behind any case.
 
 ### Earlier results and why they were retired
 
@@ -184,21 +197,34 @@ latency. Those numbers are **not comparable** with the tables above and should n
   missed `$1,299`.
 - It ran single-turn, without history, at a different temperature than production.
 
-The phase-over-phase story still holds directionally (sending ~10 filtered products instead of all 60 cut
-latency roughly in half), but the absolute numbers need the re-run above. See [CHANGELOG.md](CHANGELOG.md).
+The 40 s latency was real, and is now explained: almost all of it was reasoning tokens generated before the
+first visible token (see *Latency*). See [CHANGELOG.md](CHANGELOG.md) for the full list of changes.
 
 ---
 
 ## Latency
 
 Each LLM turn reports `latency`, `ttft` (time to first visible token) and `tok/s` under the answer and in the
-evaluation output. Things to check when optimising, in order of likely impact:
+evaluation output.
 
-1. **Reasoning tokens.** Reasoning-capable models emit thinking tokens before the first visible token.
-   `OLLAMA_REASONING` is `false` by default; set it to `true` and compare TTFT to see what thinking costs.
-2. **Prompt size.** `MAX_PROMPT_PRODUCTS` (default 8) controls how many products are sent.
-3. **Model size.** `OLLAMA_MODEL` — try a smaller model and compare the evaluation scores, not just the speed.
-4. **Cold start.** The embedding model and index are loaded at startup, not on the first message.
+Measured on the same machine and model, changing only `OLLAMA_REASONING`:
+
+| | Reasoning off (default) | Reasoning on |
+|---|---|---|
+| Suite | all (55 LLM turns) | v1 (19 LLM turns) |
+| Latency avg / p50 / p95 | 6.9 s / 5.4 s / 8.4 s | 44.2 s / 38.7 s / 86.7 s |
+| Time to first token | 1.8 s | 39.8 s |
+| v1 cases passed | 19 / 20 | 20 / 20 |
+
+With reasoning on, the customer waits about 40 s before the first word appears; generation after that takes
+roughly the same 4–5 s either way. The one-case difference in pass rate is a single run at temperature 0.7 and
+is not evidence that reasoning improves answers — that would need repeated runs.
+
+Other levers, not yet measured:
+
+- **Prompt size.** `MAX_PROMPT_PRODUCTS` (default 8) controls how many products are sent.
+- **Model size.** `OLLAMA_MODEL` — compare evaluation scores, not just speed.
+- **Cold start.** The embedding model and index are loaded at startup, not on the first message.
 
 ---
 
@@ -248,7 +274,7 @@ Windows `cmd`: `set OLLAMA_REASONING=true` then `python main.py`.
   existing slot tests.
 - **Grounding checks are lexical.** They catch a model that names a product it was not given or misquotes a
   price, not subtle spec errors in free text. An LLM-as-judge pass is not implemented.
-- **Category labels** feed only the cross-sell buttons; accuracy without the vector index is 50/54.
+- **Category labels** feed only the cross-sell buttons; 50/54 match, with or without the vector index.
 - **In-memory state.** Sessions and cache live in the process; no persistence, no multi-worker support.
 - **Accessories, warranties and discounts are not in the catalog**, so those questions get an honest
   "not available in this demo" instead of a generated answer.
@@ -283,7 +309,8 @@ lenovo-ai-sales-chatbot/
 │   ├── test_cases.py           # 40 single-turn + 14 multi-turn cases
 │   ├── checks.py               # constraint / grounding / keyword checks
 │   ├── evaluator.py
-│   └── run_eval.py             # CLI
+│   ├── run_eval.py             # CLI
+│   └── recheck.py              # re-run text checks on a saved results file
 ├── tests/                      # pytest suite
 ├── chatbot_design_document.md  # original design (pre-implementation)
 ├── chatbot_evaluation.md       # evaluation design + implementation status
