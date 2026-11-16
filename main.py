@@ -1,157 +1,80 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from langchain_ollama import ChatOllama
-from langchain_core.messages import HumanMessage, SystemMessage
-import uvicorn
-import json
-import time
+import asyncio
+import logging
 import uuid
+from contextlib import asynccontextmanager
 
-from agents.session_manager import session_manager
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+from agents.catalog import load_products
 from agents.sales_graph import build_sales_graph
+from agents.session_manager import session_manager
+from chat_service import build_llm, run_turn
+from config import settings
 
-app = FastAPI()
-app.mount("/static", StaticFiles(directory="static"), name="static")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("chatbot")
 
-llm = ChatOllama(
-    model="qwen3.5:27b",
-    base_url="http://localhost:11434",
-    temperature=0.7,
-)
 
-graph = build_sales_graph()
+def create_app(llm=None, graph=None, warm_up: bool = True) -> FastAPI:
+    """App factory. Tests inject a fake LLM and a graph without the vector index."""
 
-def build_cta(category: str) -> str:
-    cta_data = {
-        "actions": [
-            {"label": "View Full Specs", "action": "specs"},
-            {"label": "Compare Models", "action": "compare"},
-            {"label": "Talk to a Rep", "action": "rep"},
-        ],
-        "crosssell": []
-    }
-    crosssell_map = {
-        "gaming": [
-            {"label": "+ Gaming Mouse", "msg": "What gaming mice do you recommend?"},
-            {"label": "+ Gaming Headset", "msg": "Do you have gaming headset recommendations?"},
-        ],
-        "business": [
-            {"label": "+ Docking Station", "msg": "What docking stations work with this laptop?"},
-            {"label": "+ Extended Warranty", "msg": "Tell me about warranty options"},
-        ],
-        "creative": [
-            {"label": "+ External Monitor", "msg": "What monitors pair well with this for creative work?"},
-            {"label": "+ Stylus/Pen", "msg": "Do you recommend a stylus for creative work?"},
-        ],
-        "student": [
-            {"label": "+ Laptop Bag", "msg": "What laptop bags do you recommend for students?"},
-            {"label": "+ Student Discount", "msg": "Are there any student discounts available?"},
-        ],
-        "smb": [
-            {"label": "+ Business Support", "msg": "What business support plans are available?"},
-            {"label": "+ Bulk Pricing", "msg": "Do you offer bulk pricing for businesses?"},
-        ],
-    }
-    cta_data["crosssell"] = crosssell_map.get(category or "all", [])
-    return json.dumps(cta_data)
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        if warm_up:
+            # Load the embedding model and index before the first customer message
+            # instead of making that customer wait for it.
+            try:
+                from agents.rag_retriever import get_retriever
+                await asyncio.to_thread(get_retriever)
+            except Exception:
+                log.exception("Vector index unavailable at startup; lexical ranking will be used")
+        yield
 
-@app.get("/")
-async def root():
-    return FileResponse("static/index.html")
+    app = FastAPI(title="Lenovo AI Sales Chatbot (demo)", lifespan=lifespan)
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+    app.state.llm = llm if llm is not None else build_llm()
+    app.state.graph = graph if graph is not None else build_sales_graph()
 
-@app.websocket("/ws/chat")
-async def websocket_chat(websocket: WebSocket):
-    await websocket.accept()
-    session_id = str(uuid.uuid4())
-    session = session_manager.get_or_create(session_id)
+    @app.get("/")
+    async def root():
+        return FileResponse("static/index.html")
 
-    try:
-        while True:
-            user_msg = await websocket.receive_text()
-            turn_start = time.time()
-            session.turn_count += 1
+    @app.get("/healthz")
+    async def healthz():
+        return {"status": "ok", "products": len(load_products()), "model": settings.ollama_model}
 
-            # ── LangGraph Decision ──
-            state = graph.invoke({
-                "session": session,
-                "user_msg": user_msg,
-                "action": None,
-                "response": None,
-                "category": None,
-                "matched_products": None,
-                "system_prompt": None,
-                "skip": False,
-            })
+    @app.websocket("/ws/chat")
+    async def websocket_chat(websocket: WebSocket):
+        await websocket.accept()
+        session_id = str(uuid.uuid4())
+        session = session_manager.get_or_create(session_id)
+        try:
+            while True:
+                user_msg = (await websocket.receive_text()).strip()
+                if not user_msg:
+                    await websocket.send_text("[DONE]")
+                    continue
+                user_msg = user_msg[:settings.max_message_chars]
+                try:
+                    await run_turn(session, user_msg, app.state.graph, app.state.llm, websocket.send_text)
+                except WebSocketDisconnect:
+                    raise
+                except Exception:
+                    # One bad turn must not kill the conversation or leave the UI locked.
+                    log.exception("Turn failed (session %s)", session_id)
+                    await websocket.send_text("Sorry, something went wrong on my side. Please try again.")
+                    await websocket.send_text("[DONE]")
+        except WebSocketDisconnect:
+            pass
+        finally:
+            session_manager.clear(session_id)
 
-            action = state["action"]
-            category = state.get("category") or "all"
+    return app
 
-            # ── Execute Action ──
-            if action in ("direct", "clarify"):
-                await websocket.send_text(state["response"])
-                await websocket.send_text("[DONE]")
-                if action == "clarify":
-                    session.history.append(HumanMessage(content=user_msg))
-                continue
-
-            if action == "cache":
-                await websocket.send_text(state["response"])
-                cta = build_cta(category)
-                await websocket.send_text(f"[CTA]{cta}")
-                await websocket.send_text("[DONE]")
-                latency = round(time.time() - turn_start, 2)
-                await websocket.send_text(f"[METRICS] latency:{latency}s | route:{category} | type:cache | llm:skipped")
-                session.history.append(HumanMessage(content=user_msg))
-                continue
-
-            if action == "factual":
-                await websocket.send_text(state["response"])
-                cta = build_cta(category)
-                await websocket.send_text(f"[CTA]{cta}")
-                await websocket.send_text("[DONE]")
-                latency = round(time.time() - turn_start, 2)
-                await websocket.send_text(f"[METRICS] latency:{latency}s | route:{category} | type:factual | llm:skipped")
-                session.history.append(HumanMessage(content=user_msg))
-                continue
-
-            if action == "llm":
-                # Streaming LLM call
-                system_prompt = state["system_prompt"]
-                context_history = session.history[-6:]
-                messages = [SystemMessage(content=system_prompt)] + context_history + \
-                           [HumanMessage(content=user_msg)]
-
-                full_response = ""
-                async for chunk in llm.astream(messages):
-                    token = chunk.content
-                    full_response += token
-                    await websocket.send_text(token)
-
-                latency = round(time.time() - turn_start, 2)
-                token_estimate = len(system_prompt.split()) + len(user_msg.split()) + \
-                                 len(full_response.split())
-
-                cta = build_cta(category)
-                await websocket.send_text(f"[CTA]{cta}")
-                await websocket.send_text("[DONE]")
-                await websocket.send_text(
-                    f"[METRICS] latency:{latency}s | route:{category} | "
-                    f"type:llm | tokens:~{token_estimate} | llm:called"
-                )
-
-                session.history.append(HumanMessage(content=user_msg))
-                session.history.append(HumanMessage(content=full_response))
-
-                # Store in cache
-                session.cache.store_entry(user_msg, full_response, category)
-
-    except WebSocketDisconnect:
-        session_manager.clear(session_id)
-    except Exception as e:
-        print(f"ERROR: {e}")
-        import traceback
-        traceback.print_exc()
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:create_app", factory=True, host=settings.host, port=settings.port,
+                reload=settings.reload)
