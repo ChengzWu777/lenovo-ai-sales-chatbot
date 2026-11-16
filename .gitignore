@@ -4,24 +4,20 @@ __pycache__/
 *.pyo
 .venv/
 *.egg-info/
+.pytest_cache/
 
-# ChromaDB
+# ChromaDB index (rebuilt automatically from data/products.json)
 data/chroma_db/
 
-# Evaluation results
+# Evaluation output
 evaluation/results_*.json
+results_ci.json
 
 # Environment
 .env
 .env.local
 
-# VS Code
+# Editors / OS
 .vscode/
-
-# Windows
 Thumbs.db
 desktop.ini
-
-# Docs (keep docx in repo)
-Phase1_Baseline_Report.docx
-Phase2_Comparison_Report.docx

@@ -1,112 +1,235 @@
-Lenovo AI Sales Chatbot
+# Lenovo AI Sales Chatbot
 
-An AI-powered sales assistant for Lenovo laptops, built as a personal project to demonstrate end-to-end AI application development. Features a multi-agent pipeline with LangGraph orchestration, RAG-based semantic product retrieval, and a local LLM for privacy-preserving inference.
+An AI sales assistant for Lenovo laptops, built as a personal project to show end-to-end AI application
+engineering: a deterministic decision pipeline (LangGraph), constraint-first retrieval with semantic ranking
+(ChromaDB), a locally hosted LLM (Ollama), and an evaluation suite that runs the production code path.
 
-![Python](https://img.shields.io/badge/Python-3.14-blue)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.135-green)
-![LangGraph](https://img.shields.io/badge/LangGraph-latest-orange)
+> Personal portfolio project. Not affiliated with or endorsed by Lenovo. Product data is a snapshot of
+> public listings and may be out of date.
+
+![Python](https://img.shields.io/badge/Python-3.10+-blue)
+![FastAPI](https://img.shields.io/badge/FastAPI-WebSocket-green)
+![LangGraph](https://img.shields.io/badge/LangGraph-pipeline-orange)
 ![ChromaDB](https://img.shields.io/badge/ChromaDB-RAG-purple)
+![tests](https://github.com/ChengzWu777/lenovo-ai-sales-chatbot/actions/workflows/tests.yml/badge.svg)
 
 ---
 
-## Demo
+## What it does
 
-The chatbot handles natural language queries across 60 Lenovo laptop SKUs (ThinkPad, ThinkBook, Legion, IdeaPad), with real-time streaming responses and context-aware recommendations.
+Natural-language shopping across 65 Lenovo laptop SKUs (ThinkPad, ThinkBook, Legion, IdeaPad), with streamed
+answers and a customer profile that accumulates over the conversation.
 
-**Example queries:**
 - *"I need a gaming laptop under $1200, no AMD"*
 - *"ThinkPad for business travel, must be under 3 lbs"*
-- *"Something for video editing with color accurate display"*
+- *"Something for video editing with a color accurate display"*
 - *"Compare Legion 5i vs Legion 7i"*
 
 ---
 
 ## Architecture
-User Message
-│
-▼
-┌─────────────────────────────────────────┐
-│           LangGraph Pipeline            │
-│                                         │
-│  Intent → Cache → Slots → Clarify       │
-│                              │          │
-│                           Router        │
-│                         (RAG + filter)  │
-└─────────────────────────────────────────┘
-│                    │
-│ direct/cache/       │ llm
-│ factual             ▼
-│            ┌─────────────────┐
-│            │  qwen3.5:27b    │
-│            │  (Ollama local) │
-│            │  astream()      │
-│            └─────────────────┘
-│                    │
-▼                    ▼
-WebSocket streaming → Chat UI
 
-### Agent Modules
+```
+User message
+     │
+     ▼
+┌──────────────────── LangGraph (decides, never generates) ────────────────────┐
+│                                                                              │
+│  intent ──► slots ──► cache ──► clarify ──► retrieve                         │
+│    │                    │          │           │                             │
+│    │ greeting, support, │ same     │ vague     ├─ one named model + factual  │──► factual
+│    │ off-topic,         │ question │ opener    ├─ nothing fits hard limits   │──► no_match
+│    │ injection,         │ + same   │           ├─ "show me all ..."          │──► factual
+│    │ accessory,         │ profile  │           └─ filter ► rank ► prompt     │──► llm
+│    ▼ hand-off           ▼          ▼                                         │
+│  direct               cache     clarify                                      │
+└──────────────────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+chat_service.run_turn ── streams the LLM (first-token + total timeout, catalog fallback),
+     │                   records history, emits CTA + metrics
+     ▼
+WebSocket ──► chat UI
+```
 
-| Module | File | Purpose |
-|--------|------|---------|
-| Intent Classifier | `agents/intent_classifier.py` | Routes: product / support / greeting / off-topic |
-| Slot Filler | `agents/slot_filler.py` | Extracts: budget, use_case, weight, processor, display |
-| Query Router | `agents/query_router.py` | Category routing with profile filters |
-| RAG Retriever | `agents/rag_retriever.py` | ChromaDB + MiniLM semantic search |
-| Product Matcher | `agents/product_matcher.py` | Score + filter, factual shortcut |
-| Cache Layer | `agents/cache_layer.py` | Keyword similarity cache, per-session |
-| Session Manager | `agents/session_manager.py` | Per-connection profile + history |
-| Sales Graph | `agents/sales_graph.py` | LangGraph DAG orchestration |
+Only the `llm` action calls the model. Everything else is answered deterministically from the catalog.
 
----
+### Modules
 
-## Key Features
-
-**Multi-agent LangGraph pipeline** — Each processing step (intent, cache, slots, routing, matching) is a separate graph node with conditional edges. Clean separation of decision logic from execution.
-
-**RAG semantic retrieval** — Products indexed in ChromaDB using `sentence-transformers/all-MiniLM-L6-v2`. Handles semantic queries like *"ultralight laptop for frequent flyers"* that keyword matching would miss.
-
-**Hard budget enforcement** — Slot filler extracts `budget_firm` flag. Products filtered before LLM sees them — the model cannot recommend what it cannot see.
-
-**Factual shortcut** — Price/weight/spec queries bypass the LLM entirely (0.01s response) using direct DB lookup.
-
-**Local LLM inference** — `qwen3.5:27b` via Ollama. Zero API cost, full data privacy. Streaming via `astream()` for real-time token output.
-
-**CTA + Cross-sell** — Category-aware action buttons (View Specs / Compare / Talk to Rep) and cross-sell suggestions (Gaming → Mouse/Headset, Business → Dock/Warranty).
-
-**Automated evaluation** — 40-test evaluation framework with budget compliance, keyword match, and category accuracy metrics.
+| File | Purpose |
+|------|---------|
+| `main.py` | FastAPI app factory, WebSocket endpoint, startup warm-up |
+| `chat_service.py` | Runs one turn: graph → (stream LLM) → history, cache, metrics. Used by the server **and** the evaluator |
+| `config.py` | Settings from environment variables |
+| `agents/sales_graph.py` | LangGraph pipeline and the retrieve node |
+| `agents/intent_classifier.py` | Rule-based intent, incl. injection / accessory / hand-off |
+| `agents/slot_filler.py` | Budget, use case, processor, weight, GPU, display, battery, series |
+| `agents/filters.py` | The single constraint filter (hard vs. soft, with relaxation reporting) |
+| `agents/rag_retriever.py` | ChromaDB index + semantic ranking restricted to filtered candidates |
+| `agents/product_matcher.py` | Rank fusion, superlatives, factual / list answers |
+| `agents/catalog.py` | Cached catalog, content hash, exact model-name lookup |
+| `agents/cache_layer.py` | Per-session answer cache keyed on question + profile + catalog version |
+| `agents/taxonomy.py` | Shared use-case / category vocabulary |
+| `agents/prompts.py` | Prompt templates and canned replies |
+| `evaluation/` | Test cases, checks, evaluator, CLI |
+| `tests/` | 196 unit / integration tests (no GPU, no model download) |
 
 ---
 
-## Evaluation Results
+## Design decisions
 
-### Phase 1 → Phase 2 → Phase 3 (RAG)
+**The LLM cannot break a constraint it never sees.** Hard constraints (budget ceiling, rejected processors,
+rejected product lines) are applied in code before the prompt is built. A stated budget ("under $1000",
+"budget is $800") is a ceiling; only approximate phrasing ("around $1200") gets a 10% tolerance.
 
-| Metric | Phase 1 (Naive) | Phase 2 (Agents) | Phase 3 (RAG) |
-|--------|----------------|-----------------|---------------|
-| Budget compliance | 75% | 95% | **100%** |
-| Avg latency | 84s | 49s | **40s** |
-| Products to LLM | 60/60 | ~7/60 | ~10/60 (semantic) |
-| Factual shortcut | ✗ | ✓ (0.01s) | ✓ (0.01s) |
-| Semantic queries | ✗ | ✗ | ✓ |
+**Filter first, then rank.** The constraint filter runs over the whole catalog, and the surviving ids are passed
+to ChromaDB as a metadata filter, so the top-k comes from products the customer can actually buy. Ranking is a
+reciprocal-rank fusion of the semantic order and a lexical / profile score.
 
-### V1 Test Suite (20 cases)
-Avg score:         0.96 / 1.00
-Budget compliance: 20/20 (100%)
-Keyword match:     20/20 (100%)
-Category accuracy: 17/20 (85%)
-Avg latency:       40.5s
+**Soft constraints are relaxed out loud.** If nothing satisfies weight, battery, GPU, display or form-factor
+requirements together, the unmet one is dropped *and* a `NOTE:` is added to the prompt telling the model to say
+so. If nothing satisfies the hard constraints, the customer gets a direct "nothing fits, the closest is X" reply
+with no LLM call.
+
+**Exact questions get exact answers.** A price / weight / spec question about a named model, "show me all ...",
+"cheapest", "lightest", "best battery" and named-model comparisons use lookups and sorts, not similarity search.
+
+**LangGraph decides, the handler streams.** Running the LLM inside the graph prevented token streaming
+(140 s vs 50 s in early experiments), so the graph returns an action and a prompt, and `run_turn` streams.
+
+**Deterministic NLU.** Intent and slots are rules, not LLM calls: zero added latency, fully unit-testable, and
+the failure modes are visible. The trade-off is coverage — see *Known limitations*.
+
+**Local model.** `qwen3.5:27b` via Ollama on an RTX 5090: no per-token cost and no customer data leaving the
+machine. Latency is the price; see *Latency* below.
+
+**The cache is deliberately conservative.** A hit requires the same profile, the same catalog version, the same
+numbers and negations, and near-identical keywords. A wrong cached answer is worse than a slow correct one.
 
 ---
 
-## Tech Stack
+## Evaluation
 
-- **Backend**: Python 3.14, FastAPI, WebSocket
-- **Orchestration**: LangGraph
-- **LLM**: qwen3.5:27b via Ollama (local inference)
-- **RAG**: ChromaDB + sentence-transformers (all-MiniLM-L6-v2)
-- **Frontend**: HTML/CSS/JS, WebSocket, marked.js
-- **Hardware**: NVIDIA RTX 5090 32GB (local inference)
+There are two layers.
+
+### 1. Unit / integration tests — `pytest`
+
+196 tests, a few seconds, no GPU and no model download (a deterministic embedder stands in for
+sentence-transformers; ChromaDB itself is exercised for real). Covers slot extraction, intent, cache, model-name
+lookup, constraint filtering, graph routing, turn handling (history, timeouts, fallback, cache), the WebSocket
+endpoint, index rebuilds, and the evaluator's own checks.
+
+```
+pip install -r requirements-test.txt
+pytest -q
+```
+
+### 2. End-to-end evaluation — `evaluation/run_eval.py`
+
+54 cases: 40 single-turn queries plus 14 multi-turn conversations (budget stated late, change of mind,
+cache false-hit, rejection carried across turns, follow-up comparison, withdrawn budget, impossible budget,
+prompt injection ...). Every case starts with an **empty profile** and runs through `chat_service.run_turn`,
+the function the WebSocket handler calls.
+
+| Dimension | What is checked |
+|-----------|-----------------|
+| **slots** | The profile extracted from the conversation matches the labels |
+| **routing** | Action, category, whether the LLM was called, relaxed-constraint notes |
+| **constraints** | Every product shown to the model and every product named in the answer respects budget and exclusions — checked against the catalog, not by string matching |
+| **grounding** | Products named in the answer were in the provided list; a price quoted next to a model equals the catalog price |
+| **keywords** | `must_include` / `must_not_include` on the answer text |
+
+```
+python -m evaluation.run_eval --suite all                       # real LLM, needs Ollama + GPU
+python -m evaluation.run_eval --suite all --llm stub            # pipeline + retrieval, no LLM
+python -m evaluation.run_eval --suite all --llm stub --no-rag   # no vector index either (runs in CI)
+```
+
+`--llm stub` replaces the model with one that echoes the product list it was given. It cannot judge answer
+quality, but it does answer "was the right product in front of the model, and were all constraints respected
+before generation?"
+
+### Results
+
+**Deterministic pipeline (`--suite all --llm stub --no-rag`)** — reproducible anywhere:
+
+| Metric | Result |
+|--------|--------|
+| Cases passed | 50 / 54 |
+| Constraints | 54 / 54 |
+| Slots | 54 / 54 |
+| Routing | 50 / 54 |
+| Keywords | 53 / 54 |
+| Grounding | n/a (nothing is generated) |
+
+The 4 failures are category labels that need semantic retrieval or are debatable (#22, #26, #33, #40) —
+they are left failing rather than tuned away.
+
+**Real LLM (`--suite all`)** — `qwen3.5:27b` on an RTX 5090, reasoning off, temperature 0.7, single run
+(2026-11-16):
+
+| Metric | Result |
+|--------|--------|
+| Cases passed | 50 / 54 |
+| Constraints | 54 / 54 |
+| Slots | 54 / 54 |
+| Grounding | 54 / 54 |
+| Keywords | 54 / 54 |
+| Routing | 50 / 54 |
+| LLM latency | avg 6.9 s, p50 5.4 s, p95 8.4 s |
+| Time to first token | avg 1.8 s |
+| Turns answered without the LLM | 9 of 64 |
+
+The four failures are category labels (#22, #26, #33, #40 — the same four as without the vector index;
+category only drives the cross-sell buttons).
+
+The run itself printed 47 / 54. Three of its flags were evaluator errors, found by reading the answers, fixed,
+and re-scored from the saved responses without calling the model again: two grounding flags where one catalog
+name is a prefix of another ("ThinkBook 14 Gen 7" / "... Intel"), and one forbidden-keyword flag on an answer
+that correctly said "(excluding IdeaPads)". One run at temperature 0.7 is a snapshot, not a distribution;
+`python -m evaluation.recheck --show 34` prints the answer behind any case.
+
+### Earlier results and why they were retired
+
+The first evaluator (20 single-turn cases) reported 100% budget compliance, 0.96 average score and 40.5 s average
+latency. Those numbers are **not comparable** with the tables above and should not be quoted as current:
+
+- It wrote each case's `budget_max` / `budget_firm` labels into the profile before running, so "budget
+  compliance" measured the filter against its own input. In the live pipeline "under $1000" was not treated as
+  firm and allowed $1,100.
+- `must_include` passed if any one keyword appeared, a category of `all` always passed, and the price regex
+  missed `$1,299`.
+- It ran single-turn, without history, at a different temperature than production.
+
+The 40 s latency was real, and is now explained: almost all of it was reasoning tokens generated before the
+first visible token (see *Latency*). See [CHANGELOG.md](CHANGELOG.md) for the full list of changes.
+
+---
+
+## Latency
+
+Each LLM turn reports `latency`, `ttft` (time to first visible token) and `tok/s` under the answer and in the
+evaluation output.
+
+Measured on the same machine and model, changing only `OLLAMA_REASONING`:
+
+| | Reasoning off (default) | Reasoning on |
+|---|---|---|
+| Suite | all (55 LLM turns) | v1 (19 LLM turns) |
+| Latency avg / p50 / p95 | 6.9 s / 5.4 s / 8.4 s | 44.2 s / 38.7 s / 86.7 s |
+| Time to first token | 1.8 s | 39.8 s |
+| v1 cases passed | 20 / 20 | 20 / 20 |
+
+With reasoning on, the customer waits about 40 s before the first word appears; generation after that takes
+roughly the same 4–5 s either way. On this suite reasoning bought no measurable quality for about 6x the
+latency. That is one run per setting at temperature 0.7, so it shows the cost clearly and the quality only
+roughly.
+
+Other levers, not yet measured:
+
+- **Prompt size.** `MAX_PROMPT_PRODUCTS` (default 8) controls how many products are sent.
+- **Model size.** `OLLAMA_MODEL` — compare evaluation scores, not just speed.
+- **Cold start.** The embedding model and index are loaded at startup, not on the first message.
 
 ---
 
@@ -114,83 +237,94 @@ Avg latency:       40.5s
 
 ### Prerequisites
 - Python 3.10+
-- [Ollama](https://ollama.ai) installed and running
-- NVIDIA GPU recommended (RTX 3080+ for qwen3.5:27b)
+- [Ollama](https://ollama.com) installed and running
+- NVIDIA GPU recommended for `qwen3.5:27b`
 
-### Installation
+### Install and run
 
-```bash
-# Clone
+```
 git clone https://github.com/ChengzWu777/lenovo-ai-sales-chatbot.git
 cd lenovo-ai-sales-chatbot
-
-# Install dependencies
-pip install fastapi uvicorn websockets langchain-ollama langgraph \
-            chromadb sentence-transformers python-dotenv
-
-# Pull LLM model
+pip install -r requirements.txt
 ollama pull qwen3.5:27b
-
-# Index product catalog into ChromaDB
-python -c "from agents.rag_retriever import get_retriever; get_retriever()"
-
-# Start server
 python main.py
 ```
 
-Open `http://localhost:8000` in your browser.
+Open http://localhost:8000. The vector index is built on first start and rebuilt automatically whenever
+`data/products.json` changes.
 
-### Run Evaluation
+### Configuration (environment variables)
 
-```bash
-# V1 test suite (20 cases)
-python evaluation/run_eval.py --suite v1
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `OLLAMA_MODEL` | `qwen3.5:27b` | Model served by Ollama |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint |
+| `OLLAMA_REASONING` | `false` | Enable thinking tokens |
+| `LLM_TEMPERATURE` | `0.7` | Sampling temperature (same for serving and evaluation) |
+| `LLM_FIRST_TOKEN_TIMEOUT_S` | `60` | Give up and send the catalog fallback if no token arrives |
+| `LLM_TOTAL_TIMEOUT_S` | `180` | Hard limit for one answer |
+| `HISTORY_WINDOW` | `6` | Messages of history sent to the model |
+| `MAX_PROMPT_PRODUCTS` | `8` | Products in the prompt |
+| `EMBED_MODEL` | `all-MiniLM-L6-v2` | sentence-transformers model |
+| `HOST` / `PORT` / `RELOAD` | `127.0.0.1` / `8000` / `false` | Server |
 
-# V2 test suite (20 cases, edge cases + semantic)
-python evaluation/run_eval.py --suite v2
+Windows `cmd`: `set OLLAMA_REASONING=true` then `python main.py`.
 
-# Full 40-case suite
-python evaluation/run_eval.py --suite all
+---
+
+## Known limitations
+
+- **Rule-based NLU has a coverage ceiling.** Unusual phrasings of budgets, negations or use cases will be missed.
+  The next step is an LLM / small-classifier fallback when the rules extract nothing, measured against the
+  existing slot tests.
+- **Grounding checks are lexical.** They catch a model that names a product it was not given or misquotes a
+  price, not subtle spec errors in free text. An LLM-as-judge pass is not implemented.
+- **Category labels** feed only the cross-sell buttons; 50/54 match, with or without the vector index.
+- **In-memory state.** Sessions and cache live in the process; no persistence, no multi-worker support.
+- **Accessories, warranties and discounts are not in the catalog**, so those questions get an honest
+  "not available in this demo" instead of a generated answer.
+- **No live agent hand-off.** The hand-off reply shows the profile summary that would be passed on.
+- **WebSocket framing is in-band** (`[DONE]`, `[CTA]`, `[METRICS]` text frames) rather than typed JSON messages.
+
+---
+
+## Project structure
+
 ```
-
----
-
-## Project Structure
-ai-sales-chatbot/
-├── main.py                    # FastAPI app, WebSocket handler, pipeline execution
+lenovo-ai-sales-chatbot/
+├── main.py                     # FastAPI app factory + WebSocket endpoint
+├── chat_service.py             # one conversation turn (shared by server and evaluator)
+├── config.py                   # environment-based settings
 ├── agents/
-│   ├── sales_graph.py         # LangGraph DAG — decision routing
-│   ├── intent_classifier.py   # Intent classification
-│   ├── slot_filler.py         # Structured slot extraction
-│   ├── query_router.py        # Category routing + profile filters
-│   ├── rag_retriever.py       # ChromaDB semantic retrieval
-│   ├── product_matcher.py     # Product scoring + factual detection
-│   ├── cache_layer.py         # Per-session keyword cache
-│   └── session_manager.py     # Session profile + history
-├── data/
-│   └── products.json          # 60 Lenovo laptops (source of truth)
-├── static/
-│   └── index.html             # Chat UI + WebSocket client
-└── evaluation/
-├── test_cases.py          # 40 test cases (V1 + V2)
-├── evaluator.py           # Automated evaluation engine
-└── run_eval.py            # CLI evaluation runner
-
----
-
-## Design Decisions
-
-**Why local LLM?** Privacy, zero inference cost, and RTX 5090 provides sufficient performance for a PoC. Latency (~40s avg) is acceptable for a demo environment.
-
-**Why LangGraph for routing only?** Initial implementation used LangGraph for all nodes including LLM. This killed streaming (140s vs 50s). Current architecture uses LangGraph for decision logic only, with `astream()` executed directly in the WebSocket handler.
-
-**Why RAG over keyword routing?** Keyword routing fails on semantic queries like *"something for coffee shop work"* or *"laptop for nurses"*. RAG handles these naturally while maintaining fast retrieval.
-
-**Phase-based development** — Each phase was evaluated against the same 20-query test set before proceeding. This mirrors production ML development practices where changes must be justified by measured improvements.
+│   ├── sales_graph.py          # LangGraph pipeline
+│   ├── intent_classifier.py
+│   ├── slot_filler.py
+│   ├── filters.py              # hard / soft constraints
+│   ├── rag_retriever.py        # ChromaDB semantic ranking
+│   ├── product_matcher.py      # rank fusion, superlatives, factual answers
+│   ├── catalog.py              # catalog cache + model-name lookup
+│   ├── cache_layer.py
+│   ├── session_manager.py
+│   ├── taxonomy.py
+│   ├── prompts.py
+│   └── text.py
+├── data/products.json          # 65 laptops (source of truth)
+├── static/index.html           # chat UI
+├── evaluation/
+│   ├── test_cases.py           # 40 single-turn + 14 multi-turn cases
+│   ├── checks.py               # constraint / grounding / keyword checks
+│   ├── evaluator.py
+│   ├── run_eval.py             # CLI
+│   └── recheck.py              # re-run text checks on a saved results file
+├── tests/                      # pytest suite
+├── chatbot_design_document.md  # original design (pre-implementation)
+├── chatbot_evaluation.md       # evaluation design + implementation status
+└── CHANGELOG.md
+```
 
 ---
 
 ## Author
 
-Chengzhen Wu — Senior Analyst Software Engineer  
+Chengzhen Wu — Senior Analyst Software Engineer
 [LinkedIn](https://linkedin.com/in/chengzhen-wu) | chriscwu588@gmail.com

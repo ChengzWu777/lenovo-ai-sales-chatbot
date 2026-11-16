@@ -3,6 +3,13 @@
 **Author**: Chengzhen Wu
 **Version**: 5.0
 
+> **Status of this document.** This is the original design, written before implementation, using generic
+> product names. The system as built differs in places: the model is a local `qwen3.5:27b` via Ollama rather
+> than a hosted API, retrieval is constraint filtering followed by semantic ranking (ChromaDB), the cache is
+> per-session and keyed on question + profile + catalog version, and graceful degradation is implemented as
+> first-token / total timeouts with a catalog fallback. See [README.md](README.md) for the as-built
+> architecture and [CHANGELOG.md](CHANGELOG.md) for what changed after review.
+
 ---
 
 ## Executive Summary

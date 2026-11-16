@@ -1,154 +1,248 @@
-import re
+"""End-to-end evaluation.
+
+Every case runs through chat_service.run_turn — the same function the WebSocket
+handler calls — with an empty profile, the production temperature and the real
+conversation history. Nothing from the labels is fed into the pipeline.
+
+Two LLM modes
+  real  ChatOllama, as configured in config.py
+  stub  EchoLLM: answers with the product list it was given. No GPU needed. It
+        cannot measure answer quality, but it exercises routing, slot extraction,
+        filtering, retrieval, caching and history, and it answers the question
+        "was the right product in front of the model?"
+
+Dimensions (each pass/fail per case)
+  slots        profile extracted from the conversation matches the labels
+  routing      action / category / LLM-called match what the case expects
+  constraints  every product shown to the LLM and every product named in the
+               answer respects budget and exclusions (checked against the catalog)
+  grounding    products named in the answer were provided; prices quoted match
+  keywords     must_include / must_not_include on the answer text
+"""
+import statistics
 import time
-import os
-import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from dataclasses import dataclass, field
 
-from langchain_ollama import ChatOllama
-from langchain_core.messages import HumanMessage, SystemMessage
+from agents.catalog import find_exact_mentions
 from agents.session_manager import Session
-from agents.sales_graph import build_sales_graph
+from chat_service import run_turn
+from evaluation import checks
+
+WEIGHTS = {"constraints": 0.30, "grounding": 0.20, "keywords": 0.20, "slots": 0.15, "routing": 0.15}
+DIMENSIONS = list(WEIGHTS)
 
 
-class EvalResult:
-    def __init__(self, test_id: int, description: str):
-        self.test_id = test_id
-        self.description = description
-        self.response = ""
-        self.category = ""
-        self.latency = 0.0
-        self.products_count = 0
-        self.llm_called = False
-        self.budget_ok = True
-        self.keyword_ok = True
-        self.category_ok = True
-        self.missing_keywords = []
-        self.found_forbidden = []
-        self.over_budget_prices = []
+class EchoLLM:
+    """Deterministic stand-in: replies with the product lines from the system prompt."""
+
+    async def astream(self, messages):
+        system = messages[0].content
+        lines = [ln for ln in system.splitlines() if ln.startswith("- ") and " | $" in ln]
+        text = "Products considered for this answer:\n" + "\n".join(lines)
+        for line in text.splitlines(keepends=True):
+            yield type("Chunk", (), {"content": line, "usage_metadata": None})()
+
+
+@dataclass
+class TurnRecord:
+    user: str
+    action: str
+    category: str
+    response: str
+    product_ids: list
+    latency_s: float
+    ttft_s: float | None
+    llm_called: bool
+    fallback: bool
+    failures: dict = field(default_factory=dict)   # dimension -> list of reasons
+
+
+@dataclass
+class CaseResult:
+    case_id: int
+    description: str
+    turns: list = field(default_factory=list)
+
+    def failed(self, dimension: str) -> bool:
+        return any(dimension in t.failures for t in self.turns)
 
     def score(self) -> float:
-        s = 1.0
-        if not self.budget_ok: s -= 0.4
-        if not self.keyword_ok: s -= 0.3
-        if not self.category_ok: s -= 0.3
-        return max(0.0, s)
+        return round(sum(w for d, w in WEIGHTS.items() if not self.failed(d)), 2)
+
+    @property
+    def passed(self) -> bool:
+        return not any(t.failures for t in self.turns)
 
     def to_dict(self) -> dict:
         return {
-            "id": self.test_id,
-            "description": self.description,
-            "category": self.category,
-            "latency": self.latency,
-            "products": self.products_count,
-            "llm_called": self.llm_called,
-            "budget_ok": self.budget_ok,
-            "keyword_ok": self.keyword_ok,
-            "category_ok": self.category_ok,
-            "score": self.score(),
-            "issues": {
-                "missing_keywords": self.missing_keywords,
-                "found_forbidden": self.found_forbidden,
-                "over_budget_prices": self.over_budget_prices,
-            }
+            "id": self.case_id, "description": self.description, "score": self.score(),
+            "passed": self.passed,
+            **{f"{d}_ok": not self.failed(d) for d in DIMENSIONS},
+            "turns": [{
+                "user": t.user, "action": t.action, "category": t.category,
+                "llm_called": t.llm_called, "fallback": t.fallback,
+                "latency_s": t.latency_s, "ttft_s": t.ttft_s,
+                "product_ids": t.product_ids, "failures": t.failures, "response": t.response,
+            } for t in self.turns],
         }
 
 
+def normalize_case(case: dict) -> dict:
+    """Turn a single-turn case into a one-turn conversation with an 'expect' block."""
+    if "turns" in case:
+        return case
+    expect = {
+        "profile": {
+            "budget_max": case.get("budget_max"),
+            "budget_firm": bool(case.get("budget_firm")),
+            "weight_max": case.get("weight_max"),
+        },
+        "max_price": checks.budget_ceiling(case.get("budget_max"), bool(case.get("budget_firm"))),
+        "must_include": case.get("must_include", []),
+        "must_not_include": case.get("must_not_include", []),
+        "reject_processor": case.get("reject_processor", []),
+        "reject_terms": case.get("reject_terms", []),
+    }
+    if case.get("expected_category", "all") != "all":
+        expect["category"] = case["expected_category"]
+    return {"id": case["id"], "description": case["description"],
+            "turns": [{"user": case["query"], "expect": expect}]}
+
+
 class Evaluator:
-    def __init__(self):
-        self.llm = ChatOllama(
-            model="qwen3.5:27b",
-            base_url="http://localhost:11434",
-            temperature=0.3,
-        )
-        self.graph = build_sales_graph()
+    def __init__(self, graph, llm, llm_mode: str = "real", cfg=None):
+        self.graph, self.llm, self.llm_mode = graph, llm, llm_mode
+        self.cfg = cfg
 
-    def run_single(self, test_case: dict) -> EvalResult:
-        result = EvalResult(test_case["id"], test_case["description"])
+    async def run_case(self, case: dict) -> CaseResult:
+        case = normalize_case(case)
+        result = CaseResult(case["id"], case["description"])
+        session = Session(session_id=f"eval_{case['id']}")
+        previous_ids: list = []
 
-        session = Session(session_id=f"eval_{test_case['id']}")
-        session.turn_count = 1
+        for turn in case["turns"]:
+            chunks: list = []
 
-        if test_case.get("budget_max"):
-            session.profile.budget_max = test_case["budget_max"]
-            session.profile.budget_firm = test_case.get("budget_firm", False)
-        if test_case.get("weight_max"):
-            session.profile.weight_max = test_case["weight_max"]
+            async def emit(text: str):
+                chunks.append(text)
 
-        start = time.time()
-
-        state = self.graph.invoke({
-            "session": session,
-            "user_msg": test_case["query"],
-            "action": None,
-            "response": None,
-            "category": None,
-            "matched_products": None,
-            "system_prompt": None,
-            "skip": False,
-        })
-
-        action = state.get("action", "direct")
-        category = state.get("category") or "all"
-        matched = state.get("matched_products") or []
-
-        response = state.get("response", "")
-        if action == "llm":
-            system_prompt = state.get("system_prompt", "")
-            messages = [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=test_case["query"])
-            ]
-            llm_result = self.llm.invoke(messages)
-            response = llm_result.content
-            result.llm_called = True
-
-        result.latency = round(time.time() - start, 2)
-        result.response = response
-        result.category = category
-        result.products_count = len(matched)
-
-        # Budget compliance
-        if test_case.get("budget_max") and test_case.get("budget_firm"):
-            prices = re.findall(r'\$(\d{3,4})', response)
-            for price_str in prices:
-                price = int(price_str)
-                if price > test_case["budget_max"]:
-                    result.budget_ok = False
-                    result.over_budget_prices.append(price)
-
-        # Keyword presence
-        response_lower = response.lower()
-        must_include = test_case.get("must_include", [])
-        if must_include:
-            found_any = any(kw.lower() in response_lower for kw in must_include)
-            if not found_any:
-                result.keyword_ok = False
-                result.missing_keywords = must_include
-
-        # Forbidden keywords
-        must_not = test_case.get("must_not_include", [])
-        for kw in must_not:
-            if kw.lower() in response_lower:
-                result.found_forbidden.append(kw)
-        if result.found_forbidden:
-            result.keyword_ok = False
-
-        # Category routing
-        expected = test_case.get("expected_category", "all")
-        if expected != "all" and category != expected and category != "all":
-            result.category_ok = False
-
+            kwargs = {"cfg": self.cfg} if self.cfg else {}
+            tr = await run_turn(session, turn["user"], self.graph, self.llm, emit, **kwargs)
+            record = TurnRecord(
+                user=turn["user"], action=tr.action, category=tr.category, response=tr.response,
+                product_ids=[p["id"] for p in tr.products], latency_s=tr.latency_s, ttft_s=tr.ttft_s,
+                llm_called=tr.llm_called, fallback=tr.fallback,
+            )
+            self._check_turn(record, tr, session, turn.get("expect", {}), previous_ids)
+            result.turns.append(record)
+            if tr.products:
+                previous_ids = [p["id"] for p in tr.products]
         return result
 
-    def run_all(self, test_cases: list, verbose: bool = True) -> list:
+    def _check_turn(self, record, tr, session, expect: dict, previous_ids: list):
+        def fail(dimension: str, reason: str):
+            record.failures.setdefault(dimension, []).append(reason)
+
+        # slots
+        if expect.get("profile"):
+            out = checks.check_profile(session.profile, expect["profile"])
+            for key, diff in out["wrong"].items():
+                fail("slots", f"{key}: expected {diff['expected']!r}, got {diff['actual']!r}")
+
+        # routing
+        if "action" in expect and tr.action != expect["action"]:
+            fail("routing", f"action: expected {expect['action']}, got {tr.action}")
+        if "category" in expect and tr.category != expect["category"]:
+            fail("routing", f"category: expected {expect['category']}, got {tr.category}")
+        if "llm_called" in expect and tr.llm_called != expect["llm_called"]:
+            fail("routing", f"llm_called: expected {expect['llm_called']}, got {tr.llm_called}")
+        if tr.fallback:
+            fail("routing", "LLM call failed or timed out; catalog fallback was sent")
+        if expect.get("relaxed") and not tr.notes:
+            fail("routing", "expected a relaxed-constraint note, none was produced")
+        if expect.get("products_subset_of_previous") and not set(record.product_ids) <= set(previous_ids):
+            fail("routing", "products are not a subset of the previous turn's products")
+        if "product_ids" in expect and record.product_ids != expect["product_ids"]:
+            fail("routing", f"products: expected {expect['product_ids']}, got {record.product_ids}")
+
+        # constraints — products shown to the model AND products the answer names
+        mentioned = find_exact_mentions(tr.response) if tr.llm_called else []
+        to_check = {p["id"]: p for p in list(tr.products) + mentioned}.values()
+        if tr.action != "no_match":
+            out = checks.check_constraints(
+                to_check, max_price=expect.get("max_price"),
+                reject_processor=expect.get("reject_processor", ()),
+                reject_terms=expect.get("reject_terms", ()),
+            )
+            for problem in out["problems"]:
+                fail("constraints", problem)
+
+        # grounding — only meaningful for generated text
+        if tr.llm_called and not tr.fallback and self.llm_mode == "real":
+            out = checks.check_grounding(tr.response, tr.products)
+            for name in out["ungrounded"]:
+                fail("grounding", f"recommends {name}, which was not in the provided list")
+            for wrong in out["wrong_prices"]:
+                fail("grounding", f"wrong price — {wrong}")
+
+        # keywords
+        out = checks.check_keywords(
+            tr.response, any_of=expect.get("must_include", ()),
+            all_of=expect.get("must_include_all", ()), none_of=expect.get("must_not_include", ()),
+        )
+        if out["missing_any"]:
+            fail("keywords", f"none of {out['missing_any']} found")
+        if out["missing_all"]:
+            fail("keywords", f"missing {out['missing_all']}")
+        if out["found_forbidden"]:
+            fail("keywords", f"forbidden {out['found_forbidden']} found")
+
+    async def run_all(self, cases: list, verbose: bool = True) -> list:
         results = []
-        for i, tc in enumerate(test_cases):
-            if verbose:
-                print(f"[{i+1:02d}/{len(test_cases)}] Running: {tc['description']}...")
-            result = self.run_single(tc)
+        for i, case in enumerate(cases):
+            started = time.monotonic()
+            result = await self.run_case(case)
             results.append(result)
             if verbose:
-                status = "✅" if result.score() >= 0.7 else "⚠️" if result.score() >= 0.4 else "❌"
-                print(f"       {status} score={result.score():.1f} | lat={result.latency}s | "
-                      f"cat={result.category} | budget_ok={result.budget_ok} | kw_ok={result.keyword_ok}")
+                status = "PASS" if result.passed else "FAIL"
+                print(f"[{i + 1:02d}/{len(cases)}] {status} #{result.case_id} {result.description} "
+                      f"(score {result.score():.2f}, {time.monotonic() - started:.1f}s)")
+                for t in result.turns:
+                    for dimension, reasons in t.failures.items():
+                        for reason in reasons:
+                            print(f"         - {dimension}: {reason}")
         return results
+
+
+def summarize(results: list) -> dict:
+    n = len(results)
+    turns = [t for r in results for t in r.turns]
+    llm_turns = [t for t in turns if t.llm_called]
+    latencies = sorted(t.latency_s for t in llm_turns)
+    ttfts = [t.ttft_s for t in llm_turns if t.ttft_s is not None]
+    actions: dict = {}
+    for t in turns:
+        actions[t.action] = actions.get(t.action, 0) + 1
+
+    def pct(k):
+        return round(100 * k / n, 1) if n else 0.0
+
+    summary = {
+        "cases": n, "turns": len(turns),
+        "cases_passed": sum(r.passed for r in results), "pass_rate_pct": pct(sum(r.passed for r in results)),
+        "avg_score": round(sum(r.score() for r in results) / n, 3) if n else 0.0,
+        "actions": actions,
+        "llm_call_rate_pct": round(100 * len(llm_turns) / len(turns), 1) if turns else 0.0,
+        "fallbacks": sum(t.fallback for t in turns),
+    }
+    for d in DIMENSIONS:
+        ok = sum(not r.failed(d) for r in results)
+        summary[f"{d}_pass"] = f"{ok}/{n}"
+        summary[f"{d}_pass_pct"] = pct(ok)
+    if latencies:
+        summary["llm_latency_avg_s"] = round(statistics.mean(latencies), 2)
+        summary["llm_latency_p50_s"] = round(statistics.median(latencies), 2)
+        summary["llm_latency_p95_s"] = round(latencies[min(len(latencies) - 1, int(0.95 * len(latencies)))], 2)
+    if ttfts:
+        summary["ttft_avg_s"] = round(statistics.mean(ttfts), 2)
+    return summary
