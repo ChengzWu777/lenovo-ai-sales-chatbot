@@ -19,7 +19,7 @@ from langgraph.graph import END, StateGraph
 
 from agents import prompts
 from agents.catalog import catalog_version, find_products_by_name, get_by_id, load_products
-from agents.filters import apply_constraints, budget_ceiling, passes_hard, violations
+from agents.filters import apply_constraints, passes_hard, violations
 from agents.intent_classifier import Intent, classify_intent
 from agents.product_matcher import (
     detect_superlative, format_factual_response, format_list_response,

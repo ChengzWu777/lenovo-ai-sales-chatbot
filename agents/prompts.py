@@ -58,7 +58,7 @@ HANDOFF_RESPONSE = (
     "Meanwhile, I'm happy to keep narrowing down options."
 )
 FALLBACK_INTRO = (
-    "The assistant is taking too long to respond, so here are the best matches straight from the catalog:"
+    "I couldn't generate a full answer just now, so here are the best matches straight from the catalog:"
 )
 
 

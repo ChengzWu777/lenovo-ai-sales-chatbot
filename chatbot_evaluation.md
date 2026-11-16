@@ -1,7 +1,28 @@
 # AI Sales Chatbot — Evaluation Framework
 
 **Author**: Chengzhen Wu
-**Version**: 2.0
+**Version**: 2.1
+
+## Implementation Status
+
+This document is the evaluation *design*. The table below says what exists in code today.
+
+| Step in this document | Status | Where |
+|-----------------------|--------|-------|
+| Step 2 — cache false hits | **Implemented** as tests: different budget, different negation, changed profile, changed catalog must miss; a rephrased repeat must hit | `tests/test_intent_and_cache.py`, multi-turn cases 103–104 |
+| Step 3 — profile accuracy across turns | **Implemented**: per-turn expected profile in multi-turn cases; change of mind, late budget, withdrawn budget | `evaluation/test_cases.py` (101–114) |
+| Step 4 — intent classification | **Implemented** as labelled unit cases, incl. off-topic and injection | `tests/test_intent_and_cache.py` |
+| Step 5 — slot extraction, negation handling | **Implemented**: ~90 labelled extraction cases; the 40 evaluation queries' labels are asserted against extraction | `tests/test_slot_filler.py` |
+| Step 6 — router category | **Implemented**, strict (a category of `all` no longer passes automatically) | `evaluation/evaluator.py` (routing) |
+| Step 7 — product match | **Partly**: constraint compliance of every product shown to the model is checked against the catalog; relevance is approximated by `must_include` | `evaluation/checks.py` |
+| Step 8 — LLM response quality | **Partly**: grounding (named products were provided, quoted prices match) and constraint compliance of named products. **Not implemented**: LLM-as-judge, human rating | `evaluation/checks.py` |
+| Step 10 — business metrics | Not implemented (no live traffic) | — |
+| End-to-end | **Implemented**: 54 cases through the production turn handler, with a stub-LLM mode for CI | `evaluation/run_eval.py` |
+| 50-conversation golden dataset | **Partly**: 14 multi-turn conversations + 40 single-turn queries | `evaluation/test_cases.py` |
+
+One principle was added after the first implementation got it wrong: **labels are never inputs.** The first
+evaluator copied each case's expected budget into the profile before running, so it measured the filter against
+its own input. Every case now starts with an empty profile, and there is a test that fails if that changes.
 
 ---
 
