@@ -1,0 +1,8 @@
+# Runtime
+fastapi>=0.115
+uvicorn[standard]>=0.30
+langgraph>=0.2
+langchain-core>=0.3
+langchain-ollama>=0.3      # 'reasoning' option on ChatOllama
+chromadb>=1.0
+sentence-transformers>=3.0
