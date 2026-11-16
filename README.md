@@ -170,20 +170,24 @@ they are left failing rather than tuned away.
 
 | Metric | Result |
 |--------|--------|
-| Cases passed | 47 / 54 |
+| Cases passed | 50 / 54 |
 | Constraints | 54 / 54 |
 | Slots | 54 / 54 |
-| Grounding | 52 / 54 |
-| Keywords | 53 / 54 |
+| Grounding | 54 / 54 |
+| Keywords | 54 / 54 |
 | Routing | 50 / 54 |
 | LLM latency | avg 6.9 s, p50 5.4 s, p95 8.4 s |
 | Time to first token | avg 1.8 s |
 | Turns answered without the LLM | 9 of 64 |
 
-Failures: four category labels (#22, #26, #33, #40 — the same four as without the vector index; category only
-drives the cross-sell buttons), two grounding flags (#6, #32) and one forbidden keyword (#34). One run at
-temperature 0.7 is a snapshot, not a distribution; `python -m evaluation.recheck --show 34` prints the answer
-behind any case.
+The four failures are category labels (#22, #26, #33, #40 — the same four as without the vector index;
+category only drives the cross-sell buttons).
+
+The run itself printed 47 / 54. Three of its flags were evaluator errors, found by reading the answers, fixed,
+and re-scored from the saved responses without calling the model again: two grounding flags where one catalog
+name is a prefix of another ("ThinkBook 14 Gen 7" / "... Intel"), and one forbidden-keyword flag on an answer
+that correctly said "(excluding IdeaPads)". One run at temperature 0.7 is a snapshot, not a distribution;
+`python -m evaluation.recheck --show 34` prints the answer behind any case.
 
 ### Earlier results and why they were retired
 
@@ -214,11 +218,12 @@ Measured on the same machine and model, changing only `OLLAMA_REASONING`:
 | Suite | all (55 LLM turns) | v1 (19 LLM turns) |
 | Latency avg / p50 / p95 | 6.9 s / 5.4 s / 8.4 s | 44.2 s / 38.7 s / 86.7 s |
 | Time to first token | 1.8 s | 39.8 s |
-| v1 cases passed | 19 / 20 | 20 / 20 |
+| v1 cases passed | 20 / 20 | 20 / 20 |
 
 With reasoning on, the customer waits about 40 s before the first word appears; generation after that takes
-roughly the same 4–5 s either way. The one-case difference in pass rate is a single run at temperature 0.7 and
-is not evidence that reasoning improves answers — that would need repeated runs.
+roughly the same 4–5 s either way. On this suite reasoning bought no measurable quality for about 6x the
+latency. That is one run per setting at temperature 0.7, so it shows the cost clearly and the quality only
+roughly.
 
 Other levers, not yet measured:
 

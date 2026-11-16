@@ -106,3 +106,6 @@ Budget semantics changed: a stated budget is a hard ceiling. Only approximate ph
 - `evaluation/recheck.py` re-runs the text checks on a saved results file and prints the answer behind a case.
 - README: real-LLM results and the reasoning on/off latency comparison (6.9 s vs 44.2 s average; time to first
   token 1.8 s vs 39.8 s).
+- Cases #34 and #40 listed "ideapad" / "chromebook" as forbidden words. A correct answer may say what it
+  excluded; the exclusion is checked on the products themselves (`reject_terms`).
+- Re-scored from the saved answers, the first real run is 50 / 54 with grounding and keywords at 54 / 54.

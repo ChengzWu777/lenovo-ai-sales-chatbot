@@ -12,7 +12,9 @@ Single-turn cases (TEST_CASES, TEST_CASES_V2)
   reject_processor / reject_terms
                      exclusions every shown or recommended product must respect
   must_include       at least one of these strings appears in the answer
-  must_not_include   none of these strings appears in the answer
+  must_not_include   none of these strings appears in the answer. Use it for strings
+                     that can only appear in a wrong answer ("ryzen 7"), not for
+                     things the answer may legitimately say it excluded.
 
 Multi-turn cases (MULTI_TURN_CASES) are conversations; each turn carries its own
 "expect" block. See evaluation/evaluator.py for the supported keys.
@@ -332,7 +334,9 @@ TEST_CASES_V2 = [
         "budget_max": 1500,
         "budget_firm": True,
         "must_include": ["intel", "rtx", "legion"],
-        "must_not_include": ["amd ryzen", "ideapad"],
+        # "ideapad" is not a forbidden word: a correct answer may say "(excluding IdeaPads)".
+        # The exclusion is enforced on products via reject_terms instead.
+        "must_not_include": ["amd ryzen"],
         "reject_processor": ["amd"],
         "reject_terms": ["ideapad"],
         "description": "Multi-constraint: no AMD no IdeaPad"
@@ -389,7 +393,8 @@ TEST_CASES_V2 = [
         "budget_max": 600,
         "budget_firm": True,
         "must_include": ["windows", "ideapad"],
-        "must_not_include": ["chromebook"],
+        # Same reasoning as #34: "not a Chromebook" is a fine thing to say.
+        "must_not_include": [],
         "reject_terms": ["chromebook"],
         "description": "Budget $600 Windows only no Chromebook"
     },
